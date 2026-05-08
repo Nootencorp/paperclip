@@ -459,6 +459,41 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("ignores cancelled children when classifying a parent's blocker attention", async () => {
+    const { companyId, agentId } = await createCompany("PBK");
+    const parentId = await insertIssue({ companyId, identifier: "PBK-1", title: "Parent", status: "blocked" });
+    const cancelledChildId = await insertIssue({
+      companyId,
+      identifier: "PBK-2",
+      title: "Cancelled child",
+      status: "cancelled",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    const explicitBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBK-3",
+      title: "Explicit covered blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: explicitBlockerId, blockedIssueId: parentId });
+    await activeRun({ companyId, agentId, issueId: explicitBlockerId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBK-3",
+    });
+    expect(parent?.blockerAttention.sampleBlockerIdentifier).not.toBe(cancelledChildId);
+    expect(parent?.blockerAttention.sampleBlockerIdentifier).not.toBe("PBK-2");
+  });
+
   it("does not treat a scheduled retry as actively covered work", async () => {
     const { companyId, agentId } = await createCompany("PBY");
     const parentId = await insertIssue({ companyId, identifier: "PBY-1", title: "Parent", status: "blocked" });

@@ -1107,6 +1107,10 @@ async function listIssueBlockerAttentionMap(
             ne(issues.status, "done"),
           ),
         );
+      // Cancelled children are excluded: a deliberately cancelled child is not
+      // outstanding work and must not surface as an implicit blocker on its
+      // parent. (Cancelled *explicit* `blocks` relations remain unresolved by
+      // design — see classifyPath; that forces cleanup of orphan relations.)
       const childRowsPromise: Promise<IssueBlockerAttentionQueryRow[]> = dbOrTx
         .select({
           issueId: issues.parentId,
@@ -1126,7 +1130,7 @@ async function listIssueBlockerAttentionMap(
           and(
             eq(issues.companyId, companyId),
             inArray(issues.parentId, chunk),
-            ne(issues.status, "done"),
+            notInArray(issues.status, ["done", "cancelled"]),
           ),
         );
       const [explicitBlockerRows, childRows] = await Promise.all([
