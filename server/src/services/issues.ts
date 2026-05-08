@@ -1304,12 +1304,11 @@ async function listIssueBlockerAttentionMap(
     }
     if (seen.has(nodeId)) {
       // Cycle-back: this node was already visited upstream on the current path.
-      // The most common shape is a child explicitly blocked-by its parent, which
-      // pairs with the implicit child->parent edge to form a cycle. Treating
-      // the cycle as covered with no propagated sample lets the upstream chain
-      // be classified by its non-cyclic edges and prevents a self-reference
-      // identifier from leaking into sampleBlockerIdentifier.
-      return { covered: true, stalled: false, sampleBlockerIdentifier: null, sampleStalledBlockerIdentifier: null };
+      // Cycle edges are filtered out of `downstream` below before recursion, so
+      // this branch should not normally be reached. If reached defensively,
+      // return neutral (no coverage, no sample, no stalled signal) — the cycle
+      // alone is not a mechanism receipt and must not pin coverage on its own.
+      return { covered: false, stalled: false, sampleBlockerIdentifier: null, sampleStalledBlockerIdentifier: null };
     }
     const node = nodesById.get(nodeId);
     if (!node || node.companyId !== companyId) {
@@ -1342,7 +1341,14 @@ async function listIssueBlockerAttentionMap(
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
 
-    const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
+    const downstream = (edgesByIssueId.get(node.id) ?? [])
+      .filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done")
+      // Drop cycle-back edges (target is an ancestor on this path or this node
+      // itself). A synthetic cycle is not a mechanism receipt: it must not
+      // contribute coverage, attention, or sample propagation. Nodes whose only
+      // downstream evidence was the cycle fall through to the leaf path below,
+      // which classifies by the node's own state/run/wake/human-wait.
+      .filter((edge) => edge.blockerIssueId !== node.id && !seen.has(edge.blockerIssueId));
     if (downstream.length > 0) {
       const nextSeen = new Set(seen);
       nextSeen.add(nodeId);

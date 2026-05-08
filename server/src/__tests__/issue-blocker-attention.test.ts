@@ -519,17 +519,14 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
-  it("does not surface a self-reference identifier when a blocked child is also a parent's child", async () => {
+  it("covers a blocked child whose parent blocker has an active run, without leaking a self-reference sample", async () => {
     // Reproduces RS-72/RS-70 shape: a child issue is explicitly blocked-by its
     // parent. The implicit child->parent edge plus the explicit child<-parent
-    // edge form a cycle in the blocker graph. Without the cycle fix the child
-    // reports state=needs_attention with sampleBlockerIdentifier equal to its
-    // own identifier (cycle-back leaks). The covering parent is the real
-    // active dependency.
-    // The parent is intentionally left without an active heartbeat run so
-    // classifyPath does not short-circuit on activeIssueIds.has(parent) and
-    // actually traverses the implicit child->parent edge — that is where the
-    // cycle (parent->child->parent) appears.
+    // edge form a cycle in the blocker graph. The cycle must not leak a
+    // self-reference identifier into sampleBlockerIdentifier. Coverage here is
+    // earned by a real mechanism receipt on the parent (an active heartbeat
+    // run), not by the cycle itself — see the negative regression below for
+    // the parent-has-no-receipt case.
     const { companyId, agentId } = await createCompany("PBC");
     const parentId = await insertIssue({
       companyId,
@@ -547,6 +544,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       assigneeAgentId: agentId,
     });
     await block({ companyId, blockerIssueId: parentId, blockedIssueId: childId });
+    await activeRun({ companyId, agentId, issueId: parentId });
 
     const child = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === childId);
 
@@ -559,6 +557,47 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       sampleBlockerIdentifier: "PBC-1",
     });
     expect(child?.blockerAttention.sampleBlockerIdentifier).not.toBe("PBC-2");
+    expect(child?.blockerAttention.sampleBlockerIdentifier).not.toBe(childId);
+  });
+
+  it("flags a blocked child as attention-required when the parent blocker has no active run/wake/human path, citing the parent (not self) as sample", async () => {
+    // Negative companion to the cycle test above: same parent/child cycle
+    // shape, but the parent has no mechanism receipt (no active heartbeat run,
+    // no pending wake, no human assignee, not in_review). The cycle alone must
+    // not pin coverage; classifyPath must classify the parent by its own
+    // leaf-state and surface the parent as the unresolved blocker. This
+    // protects against the regression where a synthetic cycle made a stranded
+    // parent look covered.
+    const { companyId, agentId } = await createCompany("PBD");
+    const parentId = await insertIssue({
+      companyId,
+      identifier: "PBD-1",
+      title: "Parent stranded without a run",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    const childId = await insertIssue({
+      companyId,
+      identifier: "PBD-2",
+      title: "Child waiting on stranded parent",
+      status: "blocked",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: parentId, blockedIssueId: childId });
+    // Intentionally no activeRun/wake/human assignment on the parent.
+
+    const child = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === childId);
+
+    expect(child?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PBD-1",
+    });
+    expect(child?.blockerAttention.sampleBlockerIdentifier).not.toBe("PBD-2");
     expect(child?.blockerAttention.sampleBlockerIdentifier).not.toBe(childId);
   });
 });
