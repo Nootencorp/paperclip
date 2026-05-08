@@ -1299,8 +1299,17 @@ async function listIssueBlockerAttentionMap(
     seen: Set<string>,
   ): PathClassification => {
     const sample = blockerSampleIdentifier(nodesById.get(nodeId));
-    if (truncated || seen.has(nodeId)) {
+    if (truncated) {
       return { covered: false, stalled: false, sampleBlockerIdentifier: sample, sampleStalledBlockerIdentifier: null };
+    }
+    if (seen.has(nodeId)) {
+      // Cycle-back: this node was already visited upstream on the current path.
+      // The most common shape is a child explicitly blocked-by its parent, which
+      // pairs with the implicit child->parent edge to form a cycle. Treating
+      // the cycle as covered with no propagated sample lets the upstream chain
+      // be classified by its non-cyclic edges and prevents a self-reference
+      // identifier from leaking into sampleBlockerIdentifier.
+      return { covered: true, stalled: false, sampleBlockerIdentifier: null, sampleStalledBlockerIdentifier: null };
     }
     const node = nodesById.get(nodeId);
     if (!node || node.companyId !== companyId) {

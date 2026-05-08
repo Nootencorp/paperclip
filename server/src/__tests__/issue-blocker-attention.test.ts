@@ -518,4 +518,47 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       sampleBlockerIdentifier: "PBY-2",
     });
   });
+
+  it("does not surface a self-reference identifier when a blocked child is also a parent's child", async () => {
+    // Reproduces RS-72/RS-70 shape: a child issue is explicitly blocked-by its
+    // parent. The implicit child->parent edge plus the explicit child<-parent
+    // edge form a cycle in the blocker graph. Without the cycle fix the child
+    // reports state=needs_attention with sampleBlockerIdentifier equal to its
+    // own identifier (cycle-back leaks). The covering parent is the real
+    // active dependency.
+    // The parent is intentionally left without an active heartbeat run so
+    // classifyPath does not short-circuit on activeIssueIds.has(parent) and
+    // actually traverses the implicit child->parent edge — that is where the
+    // cycle (parent->child->parent) appears.
+    const { companyId, agentId } = await createCompany("PBC");
+    const parentId = await insertIssue({
+      companyId,
+      identifier: "PBC-1",
+      title: "Parent making progress",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    const childId = await insertIssue({
+      companyId,
+      identifier: "PBC-2",
+      title: "Child waiting on parent",
+      status: "blocked",
+      parentId,
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: parentId, blockedIssueId: childId });
+
+    const child = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === childId);
+
+    expect(child?.blockerAttention).toMatchObject({
+      state: "covered",
+      reason: "active_dependency",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      attentionBlockerCount: 0,
+      sampleBlockerIdentifier: "PBC-1",
+    });
+    expect(child?.blockerAttention.sampleBlockerIdentifier).not.toBe("PBC-2");
+    expect(child?.blockerAttention.sampleBlockerIdentifier).not.toBe(childId);
+  });
 });
