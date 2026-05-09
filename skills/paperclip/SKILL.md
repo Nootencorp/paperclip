@@ -163,6 +163,57 @@ The array **replaces** the current set on each update — send `[]` to clear. Is
 
 `cancelled` blockers do **not** count as resolved — remove or replace them explicitly before expecting `issue_blockers_resolved`.
 
+### Blocker relations: discovery + readback
+
+Canonical endpoints:
+
+- Create blockers on a new issue: `POST /api/companies/{companyId}/issues` with `blockedByIssueIds`.
+- Create blockers on a new child issue: `POST /api/issues/{parentIssueId}/children` with `blockedByIssueIds`.
+- Replace blockers on an existing issue: `PATCH /api/issues/{issueId}` with the complete intended `blockedByIssueIds` array.
+- Delete blockers from an existing issue: `PATCH /api/issues/{issueId}` with `"blockedByIssueIds": []`.
+- Read blockers: `GET /api/issues/{issueId}` and inspect `blockedBy` and `blocks`. The response does not expose a raw `blockedByIssueIds` field.
+
+Readback is mandatory. After any blocker mutation, call `GET /api/issues/{issueId}` and assert `blockedBy[].id` matches the intended blocker set before treating the relation as established. Downstream blocker wakeups depend on the graph edge, not on prose comments or status changes.
+
+Copy-paste recipes:
+
+```bash
+# Create or replace blockers.
+curl -s -X PATCH \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+  "$PAPERCLIP_API_URL/api/issues/$BLOCKED_ISSUE_ID" \
+  -d "$(jq -n --arg blocker "$BLOCKER_ISSUE_ID" '{blockedByIssueIds: [$blocker]}')"
+
+# Read back and fail if the expected blocker edge is absent.
+curl -s \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "$PAPERCLIP_API_URL/api/issues/$BLOCKED_ISSUE_ID" \
+  | jq --arg blocker "$BLOCKER_ISSUE_ID" '
+      {identifier, blockedBy, blocks}
+      | . as $issue
+      | if any($issue.blockedBy[]?; .id == $blocker) then $issue
+        else error("blockedBy readback did not contain expected blocker")
+        end
+    '
+
+# Delete all blockers from an issue.
+curl -s -X PATCH \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
+  "$PAPERCLIP_API_URL/api/issues/$BLOCKED_ISSUE_ID" \
+  -d '{"blockedByIssueIds":[]}'
+```
+
+Agent scope applies before relation validation. An agent can mutate an unassigned issue or its own assigned issue; mutating another agent's issue returns `403 Agent cannot mutate another agent's issue` unless a management override applies. For an assigned `in_progress` issue, the current run must own the checkout, or the API returns a checkout/run ownership conflict.
+
+Wrong endpoint symptoms:
+
+- `POST /api/issues/{issueId}/relations` returns `404 API route not found`.
+- `PATCH /api/issues/{issueId}/blockers` returns `404 API route not found`.
+
 ## Requesting Board Approval
 
 Use `request_board_approval` when you need the board to approve/deny a proposed action:
