@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { activityLog } from "@paperclipai/db";
+import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclipai/shared";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
+import { and, eq } from "drizzle-orm";
 import { publishLiveEvent } from "./live-events.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
 import { sanitizeRecord } from "../redaction.js";
@@ -62,58 +63,87 @@ export interface LogActivityInput {
   details?: Record<string, unknown> | null;
 }
 
-export async function logActivity(db: Db, input: LogActivityInput) {
-  const currentUserRedactionOptions = {
-    enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
-  };
-  const sanitizedDetails = input.details ? sanitizeRecord(input.details) : null;
-  const redactedDetails = sanitizedDetails
-    ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
-    : null;
-  await db.insert(activityLog).values({
-    companyId: input.companyId,
-    actorType: input.actorType,
-    actorId: input.actorId,
-    action: input.action,
-    entityType: input.entityType,
-    entityId: input.entityId,
-    agentId: input.agentId ?? null,
-    runId: input.runId ?? null,
-    details: redactedDetails,
-  });
+async function resolveActivityRunId(db: Db, input: LogActivityInput): Promise<string | null> {
+  if (!input.runId) return null;
 
-  publishLiveEvent({
-    companyId: input.companyId,
-    type: "activity.logged",
-    payload: {
+  try {
+    const [run] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)))
+      .limit(1);
+
+    if (run?.id) return run.id;
+
+    logger.warn(
+      { runId: input.runId, companyId: input.companyId, action: input.action },
+      "dropping activity log runId because heartbeat run does not exist for company",
+    );
+    return null;
+  } catch (err) {
+    logger.warn(
+      { err, runId: input.runId, companyId: input.companyId, action: input.action },
+      "failed to validate activity log runId; dropping runId",
+    );
+    return null;
+  }
+}
+
+export async function logActivity(db: Db, input: LogActivityInput) {
+  try {
+    const resolvedRunId = await resolveActivityRunId(db, input);
+    const currentUserRedactionOptions = {
+      enabled: (await instanceSettingsService(db).getGeneral()).censorUsernameInLogs,
+    };
+    const sanitizedDetails = input.details ? sanitizeRecord(input.details) : null;
+    const redactedDetails = sanitizedDetails
+      ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
+      : null;
+    const activityPayload = {
       actorType: input.actorType,
       actorId: input.actorId,
       action: input.action,
       entityType: input.entityType,
       entityId: input.entityId,
       agentId: input.agentId ?? null,
-      runId: input.runId ?? null,
+      runId: resolvedRunId,
       details: redactedDetails,
-    },
-  });
-
-  const pluginEventType = eventTypeForActivityAction(input.action);
-  if (pluginEventType) {
-    const event: PluginEvent = {
-      eventId: randomUUID(),
-      eventType: pluginEventType,
-      occurredAt: new Date().toISOString(),
-      actorId: input.actorId,
-      actorType: input.actorType,
-      entityId: input.entityId,
-      entityType: input.entityType,
-      companyId: input.companyId,
-      payload: {
-        ...redactedDetails,
-        agentId: input.agentId ?? null,
-        runId: input.runId ?? null,
-      },
     };
-    publishPluginDomainEvent(event);
+
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      ...activityPayload,
+    });
+
+    publishLiveEvent({
+      companyId: input.companyId,
+      type: "activity.logged",
+      payload: activityPayload,
+    });
+
+    const pluginEventType = eventTypeForActivityAction(input.action);
+    if (pluginEventType) {
+      const event: PluginEvent = {
+        eventId: randomUUID(),
+        eventType: pluginEventType,
+        occurredAt: new Date().toISOString(),
+        actorId: input.actorId,
+        actorType: input.actorType,
+        entityId: input.entityId,
+        entityType: input.entityType,
+        companyId: input.companyId,
+        payload: {
+          ...redactedDetails,
+          agentId: input.agentId ?? null,
+          runId: resolvedRunId,
+        },
+      };
+      publishPluginDomainEvent(event);
+    }
+  } catch (err) {
+    logger.warn(
+      { err, companyId: input.companyId, action: input.action, entityType: input.entityType, entityId: input.entityId },
+      "activity log write failed; continuing caller mutation",
+    );
   }
 }
