@@ -45,6 +45,8 @@ Status quick guide:
 - `done`: finished.
 - `cancelled`: intentionally dropped.
 
+Blocker relation rule: create, replace, or clear first-class blockers only through `blockedByIssueIds` on issue create/update (`POST /api/companies/{companyId}/issues`, `POST /api/issues/{parentIssueId}/children`, or `PATCH /api/issues/{issueId}`). After mutation, read back `GET /api/issues/{issueId}` and assert `blockedBy[].id` contains the intended blockers before treating the graph edge as established. There is no `/api/issues/{issueId}/relations` or `/api/issues/{issueId}/blockers` mutation endpoint.
+
 ## 6. Delegation
 
 - Create subtasks with `POST /api/companies/{companyId}/issues`. Always set `parentId` and `goalId`. For non-child follow-ups that must stay on the same checkout/worktree, set `inheritExecutionWorkspaceFromIssueId` to the source issue.

@@ -2,7 +2,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import type { Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentApiKeys, agents, authUsers, companies, companyMemberships, instanceUserRoles } from "@paperclipai/db";
+import { agentApiKeys, agents, authUsers, companies, companyMemberships, heartbeatRuns, instanceUserRoles } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import type { DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
@@ -33,16 +33,20 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           }
         : { type: "none", source: "none" };
 
-    const runIdHeader = req.header("x-paperclip-run-id");
+    const runIdHeader = normalizeRunIdHeader(req.header("x-paperclip-run-id"));
 
     const authHeader = req.header("authorization");
     if (!authHeader?.toLowerCase().startsWith("bearer ")) {
       if (opts.deploymentMode === "authenticated" && opts.resolveSession) {
         const cloudTenantActor = await resolveCloudTenantActor(db, req);
         if (cloudTenantActor) {
+          const resolvedRunId = await resolveRequestRunId(db, runIdHeader, {
+            source: "cloud_tenant",
+            companyIds: cloudTenantActor.companyIds,
+          });
           req.actor = {
             ...cloudTenantActor,
-            runId: runIdHeader ?? undefined,
+            runId: resolvedRunId,
           };
           next();
           return;
@@ -88,14 +92,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
             companyIds: memberships.map((row) => row.companyId),
             memberships,
             isInstanceAdmin: Boolean(roleRow),
-            runId: runIdHeader ?? undefined,
+            runId: await resolveRequestRunId(db, runIdHeader, {
+              source: "session",
+              companyIds: memberships.map((row) => row.companyId),
+            }),
             source: "session",
           };
           next();
           return;
         }
       }
-      if (runIdHeader) req.actor.runId = runIdHeader;
       next();
       return;
     }
@@ -120,7 +126,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           memberships: access.memberships,
           isInstanceAdmin: access.isInstanceAdmin,
           keyId: boardKey.id,
-          runId: runIdHeader || undefined,
+          runId: await resolveRequestRunId(db, runIdHeader, {
+            source: "board_key",
+            companyIds: access.companyIds,
+          }),
           source: "board_key",
         };
         next();
@@ -158,12 +167,24 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
+      const signedRunId = normalizeRunIdHeader(claims.run_id);
+      if (runIdHeader && runIdHeader !== signedRunId) {
+        logger.warn(
+          { runId: runIdHeader, signedRunId, actorSource: "agent_jwt", agentId: claims.sub },
+          "Ignoring request run id header because it does not match the signed agent JWT run id",
+        );
+      }
+
       req.actor = {
         type: "agent",
         agentId: claims.sub,
         companyId: claims.company_id,
         keyId: undefined,
-        runId: runIdHeader || claims.run_id || undefined,
+        runId: await resolveRequestRunId(db, signedRunId, {
+          source: "agent_jwt",
+          agentId: claims.sub,
+          companyId: claims.company_id,
+        }),
         source: "agent_jwt",
       };
       next();
@@ -191,12 +212,102 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      runId: runIdHeader || undefined,
+      runId: await resolveRequestRunId(db, runIdHeader, {
+        source: "agent_key",
+        agentId: key.agentId,
+        companyId: key.companyId,
+      }),
       source: "agent_key",
     };
 
     next();
   };
+}
+
+function normalizeRunIdHeader(value: string | undefined | null): string | undefined {
+  const runId = value?.trim();
+  return runId && runId.length > 0 ? runId : undefined;
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isActiveRequestRunStatus(status: string): boolean {
+  return status === "running";
+}
+
+async function resolveRequestRunId(
+  db: Db,
+  runId: string | undefined,
+  opts: {
+    source: string;
+    agentId?: string | null;
+    companyId?: string | null;
+    companyIds?: readonly string[] | null;
+  },
+): Promise<string | undefined> {
+  if (!runId) return undefined;
+  if (!isUuid(runId)) {
+    logger.warn(
+      { runId, actorSource: opts.source },
+      "Ignoring request run id because it is not a valid UUID",
+    );
+    return undefined;
+  }
+
+  const run = await db
+    .select({
+      id: heartbeatRuns.id,
+      agentId: heartbeatRuns.agentId,
+      companyId: heartbeatRuns.companyId,
+      status: heartbeatRuns.status,
+    })
+    .from(heartbeatRuns)
+    .where(eq(heartbeatRuns.id, runId))
+    .then((rows) => rows[0] ?? null);
+
+  if (!run) {
+    logger.warn(
+      { runId, actorSource: opts.source },
+      "Ignoring request run id because it does not exist in heartbeat_runs",
+    );
+    return undefined;
+  }
+
+  if (!isActiveRequestRunStatus(run.status)) {
+    logger.warn(
+      { runId, actorSource: opts.source, status: run.status },
+      "Ignoring request run id because the heartbeat run is not active",
+    );
+    return undefined;
+  }
+
+  if (opts.companyId && run.companyId !== opts.companyId) {
+    logger.warn(
+      { runId, actorSource: opts.source, expectedCompanyId: opts.companyId, actualCompanyId: run.companyId },
+      "Ignoring request run id because it belongs to a different company",
+    );
+    return undefined;
+  }
+
+  if (opts.companyIds && !opts.companyIds.includes(run.companyId)) {
+    logger.warn(
+      { runId, actorSource: opts.source, allowedCompanyIds: opts.companyIds, actualCompanyId: run.companyId },
+      "Ignoring request run id because it is outside the actor company scope",
+    );
+    return undefined;
+  }
+
+  if (opts.agentId && run.agentId !== opts.agentId) {
+    logger.warn(
+      { runId, actorSource: opts.source, expectedAgentId: opts.agentId, actualAgentId: run.agentId },
+      "Ignoring request run id because it belongs to a different agent",
+    );
+    return undefined;
+  }
+
+  return run.id;
 }
 
 async function resolveCloudTenantActor(db: Db, req: Request): Promise<Express.Request["actor"] | null> {

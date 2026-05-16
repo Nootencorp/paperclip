@@ -1745,18 +1745,55 @@ export function agentRoutes(
     const recoveryActionsSvc = issueRecoveryActionService(db);
     const rows = await issuesSvc.list(req.actor.companyId, {
       assigneeAgentId: req.actor.agentId,
-      status: "todo,in_progress,blocked",
+      status: "todo,in_progress,in_review,blocked",
       includeRoutineExecutions: true,
       limit: ISSUE_LIST_DEFAULT_LIMIT,
     });
     const issueIds = rows.map((issue) => issue.id);
-    const [dependencyReadiness, recoveryActionByIssue] = await Promise.all([
-      issuesSvc.listDependencyReadiness(req.actor.companyId, issueIds),
-      recoveryActionsSvc.listActiveForIssues(req.actor.companyId, issueIds),
+    const dependencyReadiness = await issuesSvc.listDependencyReadiness(req.actor.companyId, issueIds);
+    const blockedIssueIds = rows
+      .filter((issue) => (dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0) > 0)
+      .map((issue) => issue.id);
+    const runnableAncestors = await issuesSvc.listRunnableSameAgentBlockerAncestors(
+      req.actor.companyId,
+      blockedIssueIds,
+      req.actor.agentId,
+    );
+    const missingAncestorIssueIds = [...new Set(
+      [...runnableAncestors.values()]
+        .map((ancestor) => ancestor.runnableAncestorIssueId)
+        .filter((issueId) => !rows.some((row) => row.id === issueId)),
+    )];
+    const missingAncestorRows = await issuesSvc.listByIds(req.actor.companyId, missingAncestorIssueIds);
+    const rowsById = new Map(rows.map((issue) => [issue.id, issue]));
+    for (const issue of missingAncestorRows) {
+      if (issue.assigneeAgentId === req.actor.agentId) rowsById.set(issue.id, issue);
+    }
+    const seenIssueIds = new Set<string>();
+    const effectiveRows = rows.flatMap((issue) => {
+      const readiness = dependencyReadiness.get(issue.id);
+      const hasUnresolvedBlockers = (readiness?.unresolvedBlockerCount ?? 0) > 0;
+      if (!hasUnresolvedBlockers) {
+        if (seenIssueIds.has(issue.id)) return [];
+        seenIssueIds.add(issue.id);
+        return [issue];
+      }
+
+      const ancestorIssueId = runnableAncestors.get(issue.id)?.runnableAncestorIssueId;
+      if (!ancestorIssueId) return [];
+      const ancestor = rowsById.get(ancestorIssueId);
+      if (!ancestor || seenIssueIds.has(ancestor.id)) return [];
+      seenIssueIds.add(ancestor.id);
+      return [ancestor];
+    });
+    const effectiveIssueIds = effectiveRows.map((issue) => issue.id);
+    const [effectiveDependencyReadiness, recoveryActionByIssue] = await Promise.all([
+      issuesSvc.listDependencyReadiness(req.actor.companyId, effectiveIssueIds),
+      recoveryActionsSvc.listActiveForIssues(req.actor.companyId, effectiveIssueIds),
     ]);
 
     res.json(
-      rows.map((issue) => ({
+      effectiveRows.map((issue) => ({
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
@@ -1768,9 +1805,9 @@ export function agentRoutes(
         updatedAt: issue.updatedAt,
         activeRun: issue.activeRun,
         activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-        dependencyReady: dependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
-        unresolvedBlockerCount: dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
-        unresolvedBlockerIssueIds: dependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
+        dependencyReady: effectiveDependencyReadiness.get(issue.id)?.isDependencyReady ?? true,
+        unresolvedBlockerCount: effectiveDependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0,
+        unresolvedBlockerIssueIds: effectiveDependencyReadiness.get(issue.id)?.unresolvedBlockerIssueIds ?? [],
       })),
     );
   });

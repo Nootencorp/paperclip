@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   applyPaperclipWorkspaceEnv,
   appendWithByteCap,
@@ -14,6 +14,7 @@ import {
   runningProcesses,
   runChildProcess,
   sanitizeSshRemoteEnv,
+  setRunChildProcessSpawnObserver,
   shapePaperclipWorkspaceEnvForExecution,
   rewriteWorkspaceCwdEnvVarsForExecution,
   stringifyPaperclipWakePayload,
@@ -205,6 +206,40 @@ describe("materializePaperclipSkillCopy", () => {
 });
 
 describe("runChildProcess", () => {
+  afterEach(() => {
+    setRunChildProcessSpawnObserver(null);
+    runningProcesses.clear();
+  });
+
+  it("notifies the global spawn observer when a legacy adapter omits onSpawn", async () => {
+    const runId = randomUUID();
+    const observed: { current?: { runId: string; pid: number; processGroupId: number | null; startedAt: string } } = {};
+    setRunChildProcessSpawnObserver((observedRunId, meta) => {
+      observed.current = { runId: observedRunId, ...meta };
+    });
+
+    const result = await runChildProcess(
+      runId,
+      process.execPath,
+      ["-e", "process.stdout.write('done');"],
+      {
+        cwd: process.cwd(),
+        env: {},
+        timeoutSec: 5,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(observed.current).toBeDefined();
+    const observedSpawn = observed.current!;
+    expect(observedSpawn.runId).toBe(runId);
+    expect(observedSpawn.pid).toBeTypeOf("number");
+    expect(observedSpawn.pid).toBeGreaterThan(0);
+    expect(observedSpawn.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
   it("does not arm a timeout when timeoutSec is 0", async () => {
     const result = await runChildProcess(
       randomUUID(),
