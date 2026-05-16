@@ -27,4 +27,5 @@ export type {
   AdapterAgent,
   AdapterRuntime,
 } from "@paperclipai/adapter-utils";
-export { runningProcesses } from "./utils.js";
+export { runningProcesses, setRunChildProcessSpawnObserver } from "./utils.js";
+export type { RunChildProcessSpawnMeta, RunChildProcessSpawnObserver } from "./utils.js";
