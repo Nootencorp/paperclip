@@ -67,6 +67,7 @@ import {
   type ActiveIssueTreePauseHoldGate,
 } from "./issue-tree-control.js";
 import { parseIssueGraphLivenessIncidentKey } from "./recovery/origins.js";
+import { logger } from "../middleware/logger.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -216,6 +217,10 @@ export type IssueDependencyReadiness = {
   allBlockersDone: boolean;
   isDependencyReady: boolean;
 };
+export type IssueRunnableAncestor = {
+  issueId: string;
+  runnableAncestorIssueId: string;
+};
 export type ChildIssueCompletionSummary = {
   id: string;
   identifier: string | null;
@@ -331,6 +336,102 @@ async function listIssueDependencyReadinessMap(
   }
 
   return readinessMap;
+}
+
+async function listRunnableSameAgentBlockerAncestorMap(
+  dbOrTx: Pick<Db, "select">,
+  companyId: string,
+  issueIds: string[],
+  agentId: string,
+): Promise<Map<string, IssueRunnableAncestor>> {
+  const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))];
+  const ancestorMap = new Map<string, IssueRunnableAncestor>();
+  if (uniqueIssueIds.length === 0) return ancestorMap;
+
+  const visitedByRoot = new Map<string, Set<string>>();
+  const rootByIssueId = new Map<string, string>();
+  let frontier = uniqueIssueIds;
+
+  for (let depth = 0; frontier.length > 0 && depth < RUNNABLE_ANCESTOR_MAX_DEPTH; depth += 1) {
+    const nextFrontier: string[] = [];
+
+    for (const issueId of frontier) {
+      const rootId = rootByIssueId.get(issueId) ?? issueId;
+      rootByIssueId.set(issueId, rootId);
+      const visited = visitedByRoot.get(rootId) ?? new Set<string>([rootId]);
+      visitedByRoot.set(rootId, visited);
+    }
+
+    for (const issueIdChunk of chunkList([...new Set(frontier)], ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+      const rows = await dbOrTx
+        .select({
+          issueId: issueRelations.relatedIssueId,
+          blockerIssueId: issues.id,
+          blockerStatus: issues.status,
+          blockerAssigneeAgentId: issues.assigneeAgentId,
+        })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, companyId),
+            eq(issueRelations.type, "blocks"),
+            inArray(issueRelations.relatedIssueId, issueIdChunk),
+            eq(issues.companyId, companyId),
+            ne(issues.status, "done"),
+          ),
+        );
+
+      const blockerIds = rows.map((row) => row.blockerIssueId);
+      const readinessByBlockerId = await listIssueDependencyReadinessMap(dbOrTx, companyId, blockerIds);
+
+      for (const row of rows) {
+        const rootId = rootByIssueId.get(row.issueId) ?? row.issueId;
+        if (ancestorMap.has(rootId)) continue;
+        const visited = visitedByRoot.get(rootId) ?? new Set<string>([rootId]);
+        if (visited.has(row.blockerIssueId)) {
+          logger.warn(
+            { companyId, issueId: rootId, blockerIssueId: row.blockerIssueId, depth },
+            "runnable ancestor blocker walk detected a cycle",
+          );
+          continue;
+        }
+        visited.add(row.blockerIssueId);
+        visitedByRoot.set(rootId, visited);
+
+        if (row.blockerAssigneeAgentId !== agentId) continue;
+        const blockerReadiness = readinessByBlockerId.get(row.blockerIssueId);
+        const blockerIsRunnable =
+          RUNNABLE_ANCESTOR_STATUSES.has(row.blockerStatus) &&
+          (blockerReadiness?.isDependencyReady ?? true);
+        if (blockerIsRunnable) {
+          ancestorMap.set(rootId, {
+            issueId: rootId,
+            runnableAncestorIssueId: row.blockerIssueId,
+          });
+          continue;
+        }
+        if ((blockerReadiness?.unresolvedBlockerCount ?? 0) > 0) {
+          rootByIssueId.set(row.blockerIssueId, rootId);
+          nextFrontier.push(row.blockerIssueId);
+        }
+      }
+    }
+
+    frontier = nextFrontier.filter((issueId) => {
+      const rootId = rootByIssueId.get(issueId) ?? issueId;
+      return !ancestorMap.has(rootId);
+    });
+  }
+
+  if (frontier.length > 0) {
+    logger.warn(
+      { companyId, issueIds: [...new Set(frontier)], maxDepth: RUNNABLE_ANCESTOR_MAX_DEPTH },
+      "runnable ancestor blocker walk exceeded max depth",
+    );
+  }
+
+  return ancestorMap;
 }
 
 async function listUnresolvedBlockerIssueIds(
@@ -740,6 +841,8 @@ const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] = 
 ];
 const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_MAX_DEPTH = 8;
+const RUNNABLE_ANCESTOR_MAX_DEPTH = 8;
+const RUNNABLE_ANCESTOR_STATUSES = new Set(["todo", "in_progress", "in_review"]);
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
 
@@ -2441,6 +2544,28 @@ export function issueService(db: Db) {
       });
     },
 
+    listByIds: async (companyId: string, issueIds: string[], dbOrTx: any = db) => {
+      const uniqueIssueIds = [...new Set(issueIds.filter(Boolean))];
+      if (uniqueIssueIds.length === 0) return [];
+      const rows = await dbOrTx
+        .select(issueListSelect)
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            inArray(issues.id, uniqueIssueIds),
+            isNull(issues.hiddenAt),
+          ),
+        );
+      const decodedRows = rows.map((row: typeof rows[number]) => ({
+        ...row,
+        description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
+      }));
+      const withLabels = await withIssueLabels(dbOrTx, decodedRows);
+      const runMap = await activeRunMapForIssues(dbOrTx, withLabels);
+      return withActiveRuns(withLabels, runMap);
+    },
+
     countUnreadTouchedByUser: async (companyId: string, userId: string, status?: string) => {
       const conditions = [
         eq(issues.companyId, companyId),
@@ -2585,6 +2710,15 @@ export function issueService(db: Db) {
 
     listDependencyReadiness: async (companyId: string, issueIds: string[], dbOrTx: any = db) => {
       return listIssueDependencyReadinessMap(dbOrTx, companyId, issueIds);
+    },
+
+    listRunnableSameAgentBlockerAncestors: async (
+      companyId: string,
+      issueIds: string[],
+      agentId: string,
+      dbOrTx: any = db,
+    ) => {
+      return listRunnableSameAgentBlockerAncestorMap(dbOrTx, companyId, issueIds, agentId);
     },
 
     listBlockerAttention: async (

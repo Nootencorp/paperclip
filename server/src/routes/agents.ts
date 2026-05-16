@@ -1743,7 +1743,7 @@ export function agentRoutes(
     const issuesSvc = issueService(db);
     const rows = await issuesSvc.list(req.actor.companyId, {
       assigneeAgentId: req.actor.agentId,
-      status: "todo,in_progress,blocked",
+      status: "todo,in_progress,in_review,blocked",
       includeRoutineExecutions: true,
       limit: ISSUE_LIST_DEFAULT_LIMIT,
     });
@@ -1751,9 +1751,44 @@ export function agentRoutes(
       req.actor.companyId,
       rows.map((issue) => issue.id),
     );
+    const blockedIssueIds = rows
+      .filter((issue) => (dependencyReadiness.get(issue.id)?.unresolvedBlockerCount ?? 0) > 0)
+      .map((issue) => issue.id);
+    const runnableAncestors = await issuesSvc.listRunnableSameAgentBlockerAncestors(
+      req.actor.companyId,
+      blockedIssueIds,
+      req.actor.agentId,
+    );
+    const missingAncestorIssueIds = [...new Set(
+      [...runnableAncestors.values()]
+        .map((ancestor) => ancestor.runnableAncestorIssueId)
+        .filter((issueId) => !rows.some((row) => row.id === issueId)),
+    )];
+    const missingAncestorRows = await issuesSvc.listByIds(req.actor.companyId, missingAncestorIssueIds);
+    const rowsById = new Map(rows.map((issue) => [issue.id, issue]));
+    for (const issue of missingAncestorRows) {
+      if (issue.assigneeAgentId === req.actor.agentId) rowsById.set(issue.id, issue);
+    }
+    const seenIssueIds = new Set<string>();
+    const effectiveRows = rows.flatMap((issue) => {
+      const readiness = dependencyReadiness.get(issue.id);
+      const hasUnresolvedBlockers = (readiness?.unresolvedBlockerCount ?? 0) > 0;
+      if (!hasUnresolvedBlockers) {
+        if (seenIssueIds.has(issue.id)) return [];
+        seenIssueIds.add(issue.id);
+        return [issue];
+      }
+
+      const ancestorIssueId = runnableAncestors.get(issue.id)?.runnableAncestorIssueId;
+      if (!ancestorIssueId) return [];
+      const ancestor = rowsById.get(ancestorIssueId);
+      if (!ancestor || seenIssueIds.has(ancestor.id)) return [];
+      seenIssueIds.add(ancestor.id);
+      return [ancestor];
+    });
 
     res.json(
-      rows.map((issue) => ({
+      effectiveRows.map((issue) => ({
         id: issue.id,
         identifier: issue.identifier,
         title: issue.title,
