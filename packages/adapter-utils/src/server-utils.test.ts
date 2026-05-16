@@ -213,10 +213,9 @@ describe("runChildProcess", () => {
 
   it("notifies the global spawn observer when a legacy adapter omits onSpawn", async () => {
     const runId = randomUUID();
-    let observed: { runId: string; pid: number; processGroupId: number | null; startedAt: string } | null = null;
-
+    const observed: { current?: { runId: string; pid: number; processGroupId: number | null; startedAt: string } } = {};
     setRunChildProcessSpawnObserver((observedRunId, meta) => {
-      observed = { runId: observedRunId, ...meta };
+      observed.current = { runId: observedRunId, ...meta };
     });
 
     const result = await runChildProcess(
@@ -233,10 +232,12 @@ describe("runChildProcess", () => {
     );
 
     expect(result.exitCode).toBe(0);
-    expect(observed?.runId).toBe(runId);
-    expect(observed?.pid).toBeTypeOf("number");
-    expect(observed?.pid).toBeGreaterThan(0);
-    expect(observed?.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(observed.current).toBeDefined();
+    const observedSpawn = observed.current!;
+    expect(observedSpawn.runId).toBe(runId);
+    expect(observedSpawn.pid).toBeTypeOf("number");
+    expect(observedSpawn.pid).toBeGreaterThan(0);
+    expect(observedSpawn.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
   it("does not arm a timeout when timeoutSec is 0", async () => {
