@@ -46,7 +46,7 @@ import { conflict, HttpError, notFound } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
-import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, listAdapterModelProfiles, runningProcesses, setRunChildProcessSpawnObserver } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -2299,6 +2299,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  setRunChildProcessSpawnObserver(async (runId, meta) => {
+    await persistRunProcessMetadata(runId, {
+      pid: meta.pid,
+      processGroupId: meta.processGroupId,
+      startedAt: meta.startedAt,
+    });
+  });
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };

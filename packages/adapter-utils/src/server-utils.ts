@@ -75,6 +75,17 @@ function signalRunningProcess(
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
+export type RunChildProcessSpawnMeta = { pid: number; processGroupId: number | null; startedAt: string };
+export type RunChildProcessSpawnObserver = (
+  runId: string,
+  meta: RunChildProcessSpawnMeta,
+) => void | Promise<void>;
+let runChildProcessSpawnObserver: RunChildProcessSpawnObserver | null = null;
+
+export function setRunChildProcessSpawnObserver(observer: RunChildProcessSpawnObserver | null) {
+  runChildProcessSpawnObserver = observer;
+}
+
 export const MAX_CAPTURE_BYTES = 4 * 1024 * 1024;
 export const MAX_EXCERPT_BYTES = 32 * 1024;
 const TERMINAL_RESULT_SCAN_OVERLAP_CHARS = 64 * 1024;
@@ -1928,12 +1939,27 @@ export async function runChildProcess(
         const startedAt = new Date().toISOString();
         const processGroupId = resolveProcessGroupId(child);
 
-        const spawnPersistPromise =
-          typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
-            ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt }).catch((err) => {
+        const spawnMeta =
+          typeof child.pid === "number" && child.pid > 0
+            ? { pid: child.pid, processGroupId, startedAt }
+            : null;
+        const spawnPersistTasks: Promise<void>[] = [];
+        if (spawnMeta && opts.onSpawn) {
+          spawnPersistTasks.push(
+            opts.onSpawn(spawnMeta).catch((err) => {
               onLogError(err, runId, "failed to record child process metadata");
-            })
-            : Promise.resolve();
+            }),
+          );
+        }
+        if (spawnMeta && runChildProcessSpawnObserver) {
+          spawnPersistTasks.push(
+            Promise.resolve(runChildProcessSpawnObserver(runId, spawnMeta)).catch((err) => {
+              onLogError(err, runId, "failed to notify child process spawn observer");
+            }),
+          );
+        }
+        const spawnPersistPromise =
+          spawnPersistTasks.length > 0 ? Promise.all(spawnPersistTasks).then(() => undefined) : Promise.resolve();
 
         runningProcesses.set(runId, { child, graceSec: opts.graceSec, processGroupId });
 

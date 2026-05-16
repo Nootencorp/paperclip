@@ -15,6 +15,8 @@ type BuildInvocationEnvForLogsOptions = {
 
 export const runningProcesses: Map<string, { child: ChildProcess; graceSec: number; processGroupId: number | null }> =
   serverUtils.runningProcesses;
+export const setRunChildProcessSpawnObserver = serverUtils.setRunChildProcessSpawnObserver;
+export type { RunChildProcessSpawnMeta, RunChildProcessSpawnObserver } from "@paperclipai/adapter-utils/server-utils";
 export const MAX_CAPTURE_BYTES = serverUtils.MAX_CAPTURE_BYTES;
 export const MAX_EXCERPT_BYTES = serverUtils.MAX_EXCERPT_BYTES;
 export const parseObject = serverUtils.parseObject;
