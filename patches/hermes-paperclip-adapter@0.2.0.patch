@@ -1,0 +1,117 @@
+diff --git a/dist/server/execute.js b/dist/server/execute.js
+index 93cddf8243271f5fb3ab101617f9114257e41328..68e0d99f4f04e1a6e346c8dad81a293a32c9b076 100644
+--- a/dist/server/execute.js
++++ b/dist/server/execute.js
+@@ -139,13 +139,28 @@ function buildPrompt(ctx, config) {
+ // Output parsing
+ // ---------------------------------------------------------------------------
+ /** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
+-const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
+-/** Regex for legacy session output format */
+-const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
++const SESSION_ID_REGEX = /^session_id:\s*([^\s]+)/m;
++/** Regex for legacy session output format. Require a colon so prose like "Use a session ID from..." is not captured. */
++const SESSION_ID_REGEX_LEGACY = /(?:^|\n)\s*session[_ ](?:id|saved)\s*:\s*([a-zA-Z0-9][a-zA-Z0-9_-]*)/i;
++/** Hermes missing-session error emitted when --resume points at stale persisted state. */
++const MISSING_SESSION_REGEX = /Session not found:\s*\S+|Use a session ID from a previous CLI run/i;
+ /** Regex to extract token usage from Hermes output. */
+ const TOKEN_USAGE_REGEX = /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
+ /** Regex to extract cost from Hermes output. */
+ const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
++function isUsableSessionId(value) {
++    if (typeof value !== "string")
++        return false;
++    const trimmed = value.trim();
++    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{5,}$/.test(trimmed))
++        return false;
++    return !/^(from|previous|session|id|run|runs|list|use)$/i.test(trimmed);
++}
++function isMissingSessionResumeFailure(result, stdout, stderr) {
++    if ((result.exitCode ?? 0) === 0 && !result.timedOut)
++        return false;
++    return MISSING_SESSION_REGEX.test(`${stdout}\n${stderr}`);
++}
+ // ---------------------------------------------------------------------------
+ // Response cleaning
+ // ---------------------------------------------------------------------------
+@@ -191,7 +206,7 @@ function parseHermesOutput(stdout, stderr) {
+     //
+     //   session_id: <id>
+     const sessionMatch = stdout.match(SESSION_ID_REGEX);
+-    if (sessionMatch?.[1]) {
++    if (sessionMatch?.[1] && isUsableSessionId(sessionMatch[1])) {
+         result.sessionId = sessionMatch?.[1] ?? null;
+         // The response is everything before the session_id line
+         const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
+@@ -202,7 +217,7 @@ function parseHermesOutput(stdout, stderr) {
+     else {
+         // Legacy format (non-quiet mode)
+         const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
+-        if (legacyMatch?.[1]) {
++        if (legacyMatch?.[1] && isUsableSessionId(legacyMatch[1])) {
+             result.sessionId = legacyMatch?.[1] ?? null;
+         }
+         // In non-quiet mode, extract clean response from stdout by
+@@ -282,12 +297,16 @@ export async function execute(ctx) {
+     args.push("--source", "tool");
+     // Session resume
+     const prevSessionId = cfgString(ctx.runtime?.sessionParams?.sessionId);
+-    if (persistSession && prevSessionId) {
+-        args.push("--resume", prevSessionId);
+-    }
+-    if (extraArgs?.length) {
+-        args.push(...extraArgs);
+-    }
++    const buildArgs = (resumeSessionId) => {
++        const built = [...args];
++        if (persistSession && resumeSessionId) {
++            built.push("--resume", resumeSessionId);
++        }
++        if (extraArgs?.length) {
++            built.push(...extraArgs);
++        }
++        return built;
++    };
+     // ── Build environment ──────────────────────────────────────────────────
+     const env = {
+         ...process.env,
+@@ -338,15 +357,23 @@ export async function execute(ctx) {
+         }
+         return ctx.onLog(stream, chunk);
+     };
+-    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
++    const runHermes = (runArgs) => runChildProcess(ctx.runId, hermesCmd, runArgs, {
+         cwd,
+         env,
+         timeoutSec,
+         graceSec,
+         onLog: wrappedOnLog,
+     });
++    let retriedFreshAfterMissingSession = false;
++    let result = await runHermes(buildArgs(prevSessionId));
++    let parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
++    if (persistSession && prevSessionId && isMissingSessionResumeFailure(result, result.stdout || "", result.stderr || "")) {
++        retriedFreshAfterMissingSession = true;
++        await ctx.onLog("stdout", `[hermes] Previous session was not found; retrying with a fresh session\n`);
++        result = await runHermes(buildArgs(undefined));
++        parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
++    }
+     // ── Parse output ───────────────────────────────────────────────────────
+-    const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+     await ctx.onLog("stdout", `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`);
+     if (parsed.sessionId) {
+         await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+@@ -382,7 +409,12 @@ export async function execute(ctx) {
+     // Store session ID for next run
+     if (persistSession && parsed.sessionId) {
+         executionResult.sessionParams = { sessionId: parsed.sessionId };
+-        executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
++        // Keep the full session id. Paperclip may use this display id as an
++        // explicit resume fallback before the durable task-session row is visible.
++        executionResult.sessionDisplayId = parsed.sessionId;
++    }
++    else if (retriedFreshAfterMissingSession) {
++        executionResult.clearSession = true;
+     }
+     return executionResult;
+ }

@@ -461,6 +461,25 @@ describe("buildExplicitResumeSessionOverride", () => {
       },
     });
   });
+
+  it("preserves full Hermes timestamp session ids when using the selected run fallback", () => {
+    const hermesSessionId = "20260517_183955_6ce014";
+
+    const result = buildExplicitResumeSessionOverride({
+      resumeFromRunId: "run-1",
+      resumeRunSessionIdBefore: "20260517_183955_",
+      resumeRunSessionIdAfter: hermesSessionId,
+      taskSession: null,
+      sessionCodec: codexSessionCodec,
+    });
+
+    expect(result).toEqual({
+      sessionDisplayId: hermesSessionId,
+      sessionParams: {
+        sessionId: hermesSessionId,
+      },
+    });
+  });
 });
 
 describe("formatRuntimeWorkspaceWarningLog", () => {
